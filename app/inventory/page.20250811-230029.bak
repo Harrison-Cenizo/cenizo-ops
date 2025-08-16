@@ -1,0 +1,7 @@
+﻿"use client";
+import React from "react";
+import InventoryRunner from "../components/InventoryRunner";
+
+export default function Page() {
+  return <InventoryRunner />;
+}

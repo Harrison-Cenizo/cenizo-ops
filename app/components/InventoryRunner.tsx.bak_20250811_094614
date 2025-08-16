@@ -1,0 +1,1582 @@
+﻿'use client';
+
+import { useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
+import { getCurrentUser } from 'aws-amplify/auth';
+import { LOCATIONS, ITEMS, type Location } from '../data/inventory';
+
+// ---------- Types (local) ----------
+export type Item = {
+  id: string;
+  name: string;
+  unit?: string;                 // display label (e.g., "case(20)", "5lb bag")
+  supplier?: string;
+  orderMultiple?: number;
+  sku?: string;
+  locations: string[];           // location keys
+  par?: Record<string, number>;  // per location
+  // NEW: unit-of-measure mapping for conversions
+  uom?: {
+    base: string;                // the inventory/storage unit (e.g., "case", "bag", "tub")
+    toBase: Record<string, number>; // e.g., { each: 1000, sleeve: 20 } means 1 base = 1000 each = 20 sleeves
+  };
+};
+
+type RunItem = { itemId: string; name: string; unit?: string; qty: number };
+type RunState = {
+  runId: string;
+  group: string;
+  locationName: string;
+  locationKey: string;
+  dateLocalISO: string;
+  items: RunItem[];
+  index: number;
+  by?: string;
+  startedAt?: string;
+  completedAt?: string;
+};
+
+// BOM pieces can now specify a unit
+type BomComp = { itemId?: string; qty: number; uom?: string };
+type Bom = {
+  key: string;            // sku if present, else product name key
+  name: string;
+  sku?: string;
+  type: 'drink' | 'pastry' | 'other';
+  comps: {
+    cup?: BomComp;
+    lid?: BomComp;
+    milk?: BomComp;
+    espresso?: BomComp;
+    syrup?: BomComp;
+    bag?: BomComp;
+  };
+  updatedAt: string;
+};
+
+// ---------- LocalStorage keys ----------
+const LS_RUNS      = 'cenizo-inventory-runs-v1';
+const LS_CUSTOM    = 'cenizo-inventory-custom-items-v1';
+const LS_HIDE      = 'cenizo-inventory-hidden-item-ids-v1';
+const LS_BOMS      = 'cenizo-inventory-boms-v1';
+const LS_OVERRIDES = 'cenizo-inventory-item-overrides-v1';
+
+// ---------- Rollup locations for totals ----------
+const ROLLUP = [
+  { key: 'Cenizo:Easton Park', label: 'Easton Park' },
+  { key: 'Cenizo:Del Valle',   label: 'Del Valle' },
+  { key: 'Other:Chrysler Bend',label: 'Chrysler Bend' },
+  { key: 'Other:Old Lockhart', label: 'Old Lockhart' },
+];
+
+// ---------- Helpers ----------
+function todayLocalISODate() {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString();
+}
+function makeRunId(locationKey: string) { return locationKey + '__' + todayLocalISODate(); }
+
+function loadRuns(): Record<string, RunState> {
+  if (typeof window === 'undefined') return {};
+  try { return JSON.parse(localStorage.getItem(LS_RUNS) || '{}'); } catch { return {}; }
+}
+function saveRun(run: RunState) {
+  const all = loadRuns();
+  all[run.runId] = run;
+  localStorage.setItem(LS_RUNS, JSON.stringify(all));
+}
+
+function loadCustomItems(): Item[] {
+  if (typeof window === 'undefined') return [];
+  try { return JSON.parse(localStorage.getItem(LS_CUSTOM) || '[]'); } catch { return []; }
+}
+function saveCustomItems(list: Item[]) {
+  localStorage.setItem(LS_CUSTOM, JSON.stringify(list));
+}
+
+function loadHiddenIds(): string[] {
+  if (typeof window === 'undefined') return [];
+  try { return JSON.parse(localStorage.getItem(LS_HIDE) || '[]'); } catch { return []; }
+}
+function saveHiddenIds(ids: string[]) {
+  localStorage.setItem(LS_HIDE, JSON.stringify(Array.from(new Set(ids))));
+}
+
+function loadBoms(): Record<string, Bom> {
+  if (typeof window === 'undefined') return {};
+  try { return JSON.parse(localStorage.getItem(LS_BOMS) || '{}'); } catch { return {}; }
+}
+function saveBoms(map: Record<string, Bom>) {
+  localStorage.setItem(LS_BOMS, JSON.stringify(map));
+}
+
+function loadOverrides(): Record<string, Partial<Item>> {
+  if (typeof window === 'undefined') return {};
+  try { return JSON.parse(localStorage.getItem(LS_OVERRIDES) || '{}'); } catch { return {}; }
+}
+function saveOverrides(map: Record<string, Partial<Item>>) {
+  localStorage.setItem(LS_OVERRIDES, JSON.stringify(map));
+}
+
+function slugify(s: string) { return s.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^\-+|\-+$/g,''); }
+function byGroup(group: string) { return LOCATIONS.filter(l => l.group === group); }
+
+// Merge base + custom + overrides, minus hidden
+function getAllItems(): Item[] {
+  const hidden = new Set(loadHiddenIds());
+  const overrides = loadOverrides();
+
+  const base = (ITEMS as Item[]).map(i => ({ ...i }));
+  const custom = loadCustomItems();
+
+  const merged = [...base, ...custom]
+    .filter(i => !hidden.has(i.id))
+    .map(i => {
+      const ov = overrides[i.id];
+      if (!ov) return i;
+      return {
+        ...i,
+        ...ov,
+        // merge nested fields
+        par: ov.par ? { ...(i.par || {}), ...ov.par } : i.par,
+        locations: ov.locations ? ov.locations.slice() : i.locations,
+        uom: ov.uom ? { ...(i.uom || {}), ...ov.uom, toBase: { ...(i.uom?.toBase || {}), ...(ov.uom?.toBase || {}) } } : i.uom,
+      } as Item;
+    });
+
+  return merged;
+}
+
+function getAllItemsById(): Record<string, Item> {
+  const map: Record<string, Item> = {};
+  getAllItems().forEach(i => { map[i.id] = i; });
+  return map;
+}
+
+function itemsForLocation(locationKey: string) {
+  return getAllItems()
+    .filter(i => i.locations.indexOf(locationKey) >= 0)
+    .sort((a,b) => a.name.localeCompare(b.name));
+}
+
+function csvEscape(s: string) { return '"' + (s || '').replace(/"/g, '""') + '"'; }
+function toLocal(dtISO?: string) { return dtISO ? new Date(dtISO).toLocaleString() : ''; }
+function download(filename: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 500);
+}
+
+function getMostRecentRunBeforeToday(locationKey: string): RunState | null {
+  const all = loadRuns();
+  const today = todayLocalISODate();
+  let best: { date: string; run: RunState } | null = null;
+  Object.values(all).forEach(function(run){
+    if (run.locationKey !== locationKey) return;
+    if (!run.dateLocalISO || run.dateLocalISO >= today) return;
+    if (!best || run.dateLocalISO > best.date) best = { date: run.dateLocalISO, run };
+  });
+  return best ? best.run : null;
+}
+
+// totals across rollup
+function candidateItemsForTotals() {
+  const keys = new Set(ROLLUP.map(r => r.key));
+  const seen: Record<string, { itemId: string; name: string }> = {};
+  getAllItems().forEach(function(i){ if (i.locations.some(k => keys.has(k))) seen[i.id] = { itemId: i.id, name: i.name }; });
+  const allRuns = Object.values(loadRuns());
+  const today = todayLocalISODate();
+  allRuns.forEach(function(run){
+    if (run.dateLocalISO !== today) return;
+    if (!keys.has(run.locationKey)) return;
+    run.items.forEach(function(it){ if (!seen[it.itemId]) seen[it.itemId] = { itemId: it.itemId, name: it.name }; });
+  });
+  return Object.values(seen).sort((a,b) => a.name.localeCompare(b.name));
+}
+function computeTotalsToday() {
+  const all = loadRuns();
+  const today = todayLocalISODate();
+  const keys = new Set(ROLLUP.map(r => r.key));
+  const rowsIndex: Record<string, { itemId: string; name: string; per: Record<string, number>; total: number }> = {};
+
+  candidateItemsForTotals().forEach(function(ci){
+    const per: Record<string, number> = {}; ROLLUP.forEach(function(r){ per[r.key] = 0; });
+    rowsIndex[ci.itemId] = { itemId: ci.itemId, name: ci.name, per, total: 0 };
+  });
+
+  Object.values(all).forEach(function(run){
+    if (run.dateLocalISO !== today) return;
+    if (!keys.has(run.locationKey)) return;
+    run.items.forEach(function(it){
+      const row = rowsIndex[it.itemId]; if (!row) return;
+      row.per[run.locationKey] = (row.per[run.locationKey] || 0) + Number(it.qty || 0);
+    });
+  });
+
+  Object.values(rowsIndex).forEach(function(row){
+    var t = 0; ROLLUP.forEach(function(r){ t += row.per[r.key] || 0; }); row.total = t;
+  });
+
+  return Object.values(rowsIndex).sort((a,b) => a.name.localeCompare(b.name));
+}
+
+function syncRunWithMaster(run: RunState): RunState {
+  const master = itemsForLocation(run.locationKey);
+  const byId: Record<string, RunItem> = {};
+  run.items.forEach(it => { byId[it.itemId] = it; });
+
+  const merged: RunItem[] = master.map(m => {
+    const existing = byId[m.id];
+    return existing ? existing : { itemId: m.id, name: m.name, unit: m.unit, qty: 0 };
+  });
+
+  merged.sort((a,b) => a.name.localeCompare(b.name));
+  const newIndex = Math.min(merged.length - 1, Math.max(0, run.index));
+  return { ...run, items: merged, index: newIndex };
+}
+
+// ---------- CSV parsing ----------
+function parseCSV(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let val = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        const next = text[i+1];
+        if (next === '"') { val += '"'; i++; } else { inQuotes = false; }
+      } else { val += c; }
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { row.push(val); val = ''; }
+      else if (c === '\n') { row.push(val); rows.push(row); row = []; val = ''; }
+      else if (c === '\r') { /* ignore */ }
+      else { val += c; }
+    }
+  }
+  row.push(val);
+  rows.push(row);
+  while (rows.length && rows[rows.length-1].every(function(x){ return (x||'').trim() === ''; })) rows.pop();
+  return rows;
+}
+function autoMap(headers: string[]) {
+  const lower = headers.map(h => h.toLowerCase());
+  function findOne(names: string[]): number {
+    for (let i=0;i<lower.length;i++){
+      const h = lower[i];
+      for (const n of names) if (h.indexOf(n) >= 0) return i;
+    }
+    return -1;
+  }
+  const idxItem = findOne(['item','product','menu','name','description']);
+  const idxSku  = findOne(['sku','plu','id','code']);
+  const idxQty  = findOne(['qty sold','quantity sold','qty','quantity','sold','units']);
+  return { idxItem, idxSku, idxQty };
+}
+function safeNum(s: string): number {
+  const t = (s || '').replace(/[^0-9.\-]/g,'');
+  const n = Number(t);
+  return isFinite(n) ? n : 0;
+}
+
+// ---------- UOM conversion ----------
+function toBaseUnits(it: Item | undefined, qty: number, u?: string): number {
+  if (!it || !it.uom) return qty;
+  if (!u || u === it.uom.base) return qty;
+  const perBase = it.uom.toBase?.[u];
+  if (!perBase || perBase <= 0) return qty;
+  // 1 base = perBase of 'u' -> qty 'u' equals qty / perBase in base units
+  return qty / perBase;
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+export default function InventoryRunner() {
+  // ---------- Top-level state ----------
+  const [group, setGroup] = useState<string>('Cenizo');
+  const [location, setLocation] = useState<Location | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [run, setRun] = useState<RunState | null>(null);
+  const [ready, setReady] = useState(false);
+
+  // qty input
+  const [qtyInput, setQtyInput] = useState<string>('');
+
+  // Add item UI
+  const [showAdd, setShowAdd] = useState<boolean>(false);
+  const [newName, setNewName] = useState<string>('');
+  const [newUnit, setNewUnit] = useState<string>('');
+  const [newSupplier, setNewSupplier] = useState<string>('');
+  const [newOrderMultiple, setNewOrderMultiple] = useState<string>('');
+  const [newSku, setNewSku] = useState<string>('');
+  const [newLocKeys, setNewLocKeys] = useState<Record<string, boolean>>({});
+  const [newPars, setNewPars] = useState<Record<string, string>>({});
+
+  // Manage items UI
+  const [showManage, setShowManage] = useState<boolean>(false);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<Partial<Item>>({});
+
+  // Carry-forward toggle
+  const [carryForward, setCarryForward] = useState<boolean>(true);
+
+  // Importer state
+  const [showImport, setShowImport] = useState<boolean>(false);
+  const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
+  const [csvRows, setCsvRows] = useState<string[][]>([]);
+  const [idxItem, setIdxItem] = useState<number>(-1);
+  const [idxSku, setIdxSku] = useState<number>(-1);
+  const [idxQty, setIdxQty] = useState<number>(-1);
+  const [soldTotals, setSoldTotals] = useState<Record<string, { key: string; name: string; sku?: string; qty: number }>>({});
+  const [bomMap, setBomMap] = useState<Record<string, Bom>>({});
+  const [usage, setUsage] = useState<Record<string, number>>({});
+
+  const groupLocations = useMemo(function(){ return byGroup(group); }, [group]);
+
+  // ---------- Effects ----------
+  useEffect(function() {
+    if (!location && groupLocations.length > 0) setLocation(groupLocations[0]);
+  }, [groupLocations, location]);
+
+  useEffect(function () {
+    (async function () {
+      try {
+        const u = await getCurrentUser();
+        setUserEmail(u?.username || null);
+      } catch {
+        setUserEmail(null);
+      } finally {
+        setReady(true);
+      }
+    })();
+  }, []);
+
+  // Load saved BOMs once
+  useEffect(function(){ setBomMap(loadBoms()); }, []);
+
+  // ---------- Run lifecycle ----------
+  function startRun() {
+    if (!location) return;
+    const runId = makeRunId(location.key);
+    const all = loadRuns();
+    if (all[runId]) {
+      const synced = syncRunWithMaster(all[runId]);
+      saveRun(synced); setRun(synced);
+      setQtyInput(String(synced.items[synced.index]?.qty || ''));
+      return;
+    }
+    let list: RunItem[] = itemsForLocation(location.key).map(function(i: Item){
+      return { itemId: i.id, name: i.name, unit: i.unit, qty: 0 };
+    });
+    if (carryForward) {
+      const prev = getMostRecentRunBeforeToday(location.key);
+      if (prev) {
+        const prevById: Record<string, number> = {};
+        prev.items.forEach(it => { prevById[it.itemId] = Number(it.qty || 0); });
+        list = list.map(function(ri){ return { ...ri, qty: prevById[ri.itemId] || 0 }; });
+      }
+    }
+    const newRun: RunState = {
+      runId: runId,
+      group: location.group,
+      locationName: location.name,
+      locationKey: location.key,
+      dateLocalISO: todayLocalISODate(),
+      items: list,
+      index: 0,
+      by: userEmail || undefined,
+      startedAt: new Date().toISOString(),
+    };
+    saveRun(newRun);
+    setRun(newRun);
+    setQtyInput('');
+  }
+
+  function commitQty() {
+    if (!run) return run;
+    const idx = run.index;
+    const num = Math.max(0, Math.floor(Number(qtyInput || '0')));
+    const next = { ...run, items: run.items.map(function(it, i){ return i === idx ? { ...it, qty: num } : it; }) };
+    setRun(next); saveRun(next);
+    return next;
+  }
+
+  useEffect(function(){
+    if (!run) return;
+    const q = run.items[run.index]?.qty || 0;
+    setQtyInput(q > 0 ? String(q) : '');
+  }, [run && run.index]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function setQty(num: number) {
+    if (!run) return;
+    const idx = run.index;
+    const val = Math.max(0, Math.floor(num));
+    const next = { ...run, items: run.items.map(function(it,i){ return i === idx ? { ...it, qty: val } : it; }) };
+    setRun(next); saveRun(next);
+    setQtyInput(String(val));
+  }
+  function nudge(delta: number) {
+    if (!run) return;
+    const idx = run.index;
+    const cur = run.items[idx].qty || 0;
+    setQty(cur + delta);
+  }
+  function saveAndNext() {
+    let updated = commitQty(); if (!updated) return;
+    updated = syncRunWithMaster(updated);
+    saveRun(updated); setRun(updated);
+    const idx = updated.index;
+    const nextIndex = Math.min(updated.items.length - 1, idx + 1);
+    const next = { ...updated, index: nextIndex };
+    setRun(next); saveRun(next);
+    setQtyInput(next.items[next.index]?.qty ? String(next.items[next.index].qty) : '');
+  }
+  function prev() {
+    let updated = commitQty(); if (!updated) return;
+    updated = syncRunWithMaster(updated);
+    saveRun(updated); setRun(updated);
+    const idx = updated.index;
+    const nextIndex = Math.max(0, idx - 1);
+    const next = { ...updated, index: nextIndex };
+    setRun(next); saveRun(next);
+    setQtyInput(next.items[next.index]?.qty ? String(next.items[next.index].qty) : '');
+  }
+  function jump(i: number) {
+    let updated = commitQty(); if (!updated) return;
+    updated = syncRunWithMaster(updated);
+    saveRun(updated); setRun(updated);
+    const next = { ...updated, index: i };
+    setRun(next); saveRun(next);
+    setQtyInput(next.items[i]?.qty ? String(next.items[i].qty) : '');
+  }
+  function manualSync() {
+    if (!run) return;
+    const synced = syncRunWithMaster(run);
+    saveRun(synced); setRun(synced);
+    setQtyInput(synced.items[synced.index]?.qty ? String(synced.items[synced.index].qty) : '');
+  }
+  function complete() {
+    const updated = commitQty(); if (!updated) return;
+    const synced = syncRunWithMaster(updated);
+    var finalRun = { ...synced, completedAt: synced.completedAt || new Date().toISOString() };
+    setRun(finalRun); saveRun(finalRun);
+    exportCSV(finalRun);
+    alert('Inventory saved. CSV downloaded.');
+  }
+
+  // ---------- Exporters ----------
+  function exportCSV(r: RunState) {
+    var lines: string[] = [];
+    lines.push('Group,' + csvEscape(r.group));
+    lines.push('Location,' + csvEscape(r.locationName));
+    lines.push('Location Key,' + csvEscape(r.locationKey));
+    lines.push('Run ID,' + csvEscape(r.runId));
+    lines.push('Started At,' + csvEscape(toLocal(r.startedAt)));
+    lines.push('Completed At,' + csvEscape(toLocal(r.completedAt)));
+    lines.push('By,' + csvEscape(r.by || ''));
+    lines.push('');
+    lines.push(['Item ID','Item Name','Unit','Quantity'].join(','));
+    r.items.forEach(function(it){
+      lines.push([csvEscape(it.itemId), csvEscape(it.name), csvEscape(it.unit || ''), String(it.qty || 0)].join(','));
+    });
+    var csv = lines.join('\n');
+    var file = 'inventory_' + r.locationKey.replace(/[^a-z0-9]+/gi,'-') + '_' + new Date().toISOString().slice(0,10) + '.csv';
+    download(file, csv, 'text/csv');
+  }
+
+  function exportOrderCSV(r: RunState) {
+    const itemsById = getAllItemsById();
+    type Row = {
+      supplier: string; sku?: string; name: string; unit?: string;
+      par?: number; onHand: number; need: number; orderMultiple?: number; orderQty: number;
+    };
+    const rows: Row[] = [];
+
+    r.items.forEach(function(it){
+      const meta = itemsById[it.itemId];
+      const par = meta?.par ? Number(meta.par[r.locationKey] || 0) : 0;
+      const onHand = Number(it.qty || 0);
+      const needRaw = Math.max(0, par - onHand);
+      const om = Number(meta?.orderMultiple || 1) || 1;
+      const orderQty = Math.ceil(needRaw / om) * om;
+      rows.push({
+        supplier: meta?.supplier || 'Unassigned',
+        sku: meta?.sku,
+        name: it.name,
+        unit: meta?.unit || it.unit,
+        par: meta?.par ? Number(meta.par[r.locationKey] || 0) : undefined,
+        onHand,
+        need: needRaw,
+        orderMultiple: meta?.orderMultiple,
+        orderQty
+      });
+    });
+
+    rows.sort(function(a,b){
+      const s = a.supplier.localeCompare(b.supplier);
+      if (s !== 0) return s;
+      return a.name.localeCompare(b.name);
+    });
+
+    const header = ['Supplier','SKU','Item','Unit','Par','On Hand','Need','Order Multiple','Order Qty'];
+    const lines = [header.join(',')];
+    rows.forEach(function(row){
+      lines.push([
+        csvEscape(row.supplier),
+        csvEscape(row.sku || ''),
+        csvEscape(row.name),
+        csvEscape(row.unit || ''),
+        row.par != null ? String(row.par) : '',
+        String(row.onHand),
+        String(row.need),
+        row.orderMultiple != null ? String(row.orderMultiple) : '',
+        String(row.orderQty)
+      ].join(','));
+    });
+    const csv = lines.join('\n');
+    const file = 'order_' + r.locationKey.replace(/[^a-z0-9]+/gi,'-') + '_' + new Date().toISOString().slice(0,10) + '.csv';
+    download(file, csv, 'text/csv');
+  }
+
+  // ---------- Add / remove items ----------
+  function toggleNewLoc(key: string) {
+    setNewLocKeys(function(prev){
+      const next = { ...prev, [key]: !prev[key] };
+      if (!next[key]) { setNewPars(p => { const q = { ...p }; delete q[key]; return q; }); }
+      return next;
+    });
+  }
+  function setParInput(key: string, val: string) { setNewPars(p => ({ ...p, [key]: val.replace(/[^0-9]/g,'') })); }
+  function prefillAddForm() {
+    setShowAdd(true);
+    setNewName(''); setNewUnit(''); setNewSupplier(''); setNewOrderMultiple(''); setNewSku('');
+    const init: Record<string, boolean> = {};
+    LOCATIONS.forEach(function(l){ init[l.key] = (location && l.key === location.key) ? true : false; });
+    setNewLocKeys(init);
+    const initPars: Record<string, string> = {};
+    if (location) initPars[location.key] = '';
+    setNewPars(initPars);
+  }
+  function createCustomItem() {
+    const name = (newName || '').trim();
+    const unit = (newUnit || '').trim();
+    const supplier = (newSupplier || '').trim();
+    const orderMultipleNum = Number(newOrderMultiple || '0');
+    const sku = (newSku || '').trim();
+    const selected = Object.keys(newLocKeys).filter(k => newLocKeys[k]);
+    if (!name) { alert('Please enter an item name.'); return; }
+    if (selected.length === 0) { alert('Select at least one location.'); return; }
+
+    const parRec: Record<string, number> = {};
+    selected.forEach(function(k){
+      const v = newPars[k];
+      if (v != null && v !== '') parRec[k] = Math.max(0, Math.floor(Number(v)));
+    });
+
+    const id = 'custom-' + slugify(name) + '-' + Date.now().toString(36);
+    const item: Item = {
+      id, name,
+      unit: unit || undefined,
+      locations: selected,
+      par: Object.keys(parRec).length ? parRec : undefined,
+      orderMultiple: orderMultipleNum > 0 ? orderMultipleNum : undefined,
+      supplier: supplier || undefined,
+      sku: sku || undefined
+    };
+    const list = loadCustomItems(); list.push(item); saveCustomItems(list);
+    setShowAdd(false);
+
+    if (run && selected.indexOf(run.locationKey) >= 0) {
+      const synced = syncRunWithMaster(run);
+      saveRun(synced); setRun(synced);
+    }
+
+    alert('Item added.');
+  }
+
+  function removeItem(id: string) {
+    const custom = loadCustomItems();
+    const found = custom.find(i => i.id === id);
+    if (found) {
+      if (!confirm('Remove this item?')) return;
+      saveCustomItems(custom.filter(i => i.id !== id));
+    } else {
+      if (!confirm('Remove (hide) this item? You can restore later.')) return;
+      const hidden = new Set(loadHiddenIds()); hidden.add(id); saveHiddenIds(Array.from(hidden));
+    }
+    if (run) {
+      const synced = syncRunWithMaster(run);
+      saveRun(synced); setRun(synced);
+    }
+  }
+  function restoreHidden(id: string) {
+    const hidden = new Set(loadHiddenIds()); hidden.delete(id); saveHiddenIds(Array.from(hidden));
+    if (run) {
+      const synced = syncRunWithMaster(run);
+      saveRun(synced); setRun(synced);
+    }
+  }
+
+  // ---------- Import / BOM helpers ----------
+  function recomputeSoldTotals(rows: string[][], iName: number, iSku: number, iQty: number) {
+    const totals: Record<string, { key: string; name: string; sku?: string; qty: number }> = {};
+    for (let r = 0; r < rows.length; r++) {
+      const name = rows[r][iName] || '';
+      const sku  = iSku >= 0 ? (rows[r][iSku] || '') : '';
+      const qty  = safeNum(rows[r][iQty] || '0');
+      if (!name && !sku) continue;
+      const key = (sku ? sku.trim() : name.trim().toLowerCase());
+      if (!totals[key]) totals[key] = { key, name, sku: sku || undefined, qty: 0 };
+      totals[key].qty += qty;
+    }
+    setSoldTotals(totals);
+  }
+
+  function computeUsageFromBoms(totals: Record<string, { key: string; name: string; sku?: string; qty: number }>, bomDict: Record<string, Bom>): Record<string, number> {
+    const used: Record<string, number> = {};
+    const itemsById = getAllItemsById();
+    Object.values(totals).forEach(function(row){
+      const bom = bomDict[row.key];
+      if (!bom) return;
+      const sold = Number(row.qty || 0);
+      const comps = bom.comps || {};
+      ['cup','lid','milk','espresso','syrup','bag'].forEach(function(label){
+        // @ts-ignore
+        const cc: BomComp | undefined = comps[label];
+        if (!cc || !cc.itemId || !isFinite(Number(cc.qty))) return;
+        const invItem = itemsById[cc.itemId];
+        const qtyBase = toBaseUnits(invItem, Number(cc.qty), cc.uom);
+        const add = sold * qtyBase;
+        used[cc.itemId] = (used[cc.itemId] || 0) + add;
+      });
+    });
+    return used;
+  }
+
+  function applyPrefillToToday() {
+    if (!location) { alert('Pick a location first.'); return; }
+    const runId = makeRunId(location.key);
+    let all = loadRuns();
+    let current = all[runId];
+    if (!current) { startRun(); all = loadRuns(); current = all[runId]; }
+    if (!current) { alert('Could not create today’s run.'); return; }
+
+    const used = computeUsageFromBoms(soldTotals, bomMap);
+    const nextItems = current.items.map(function(it){
+      const u = Number(used[it.itemId] || 0);
+      const est = Math.max(0, (Number(it.qty || 0) - u));
+      return { ...it, qty: Math.floor(est) };
+    });
+    const updated: RunState = { ...current, items: nextItems };
+    saveRun(updated); setRun(updated);
+    alert('Applied prefill from Toast CSV. You can adjust counts as needed.');
+  }
+
+  // ---------- UI ----------
+  if (!ready) return <div className="p-6">Loading…</div>;
+
+  // ---------- START SCREEN ----------
+  if (!run) {
+    const all = getAllItems();
+    const hiddenIds = new Set(loadHiddenIds());
+    const hiddenList = [...(ITEMS as Item[]), ...loadCustomItems()].filter(i => hiddenIds.has(i.id));
+
+    function handleFile(file: File) {
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const text = String(e.target?.result || '');
+        const rows = parseCSV(text);
+        if (!rows.length) { alert('CSV appears empty'); return; }
+        const headers = rows[0];
+        const body = rows.slice(1).filter(function(r){ return r.some(function(c){ return (c||'').trim() !== ''; }); });
+
+        setCsvHeaders(headers);
+        setCsvRows(body);
+
+        const auto = autoMap(headers);
+        setIdxItem(auto.idxItem);
+        setIdxSku(auto.idxSku);
+        setIdxQty(auto.idxQty);
+
+        if (auto.idxItem >= 0 && auto.idxQty >= 0) {
+          recomputeSoldTotals(body, auto.idxItem, auto.idxSku, auto.idxQty);
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    function saveBomEdit(b: Bom) {
+      const existing = loadBoms();
+      existing[b.key] = { ...b, updatedAt: new Date().toISOString() };
+      saveBoms(existing);
+      setBomMap(existing);
+    }
+
+    const missingBoms = Object.values(soldTotals).filter(function(row){ return !bomMap[row.key]; });
+
+    // usage preview
+    const previewUsage = computeUsageFromBoms(soldTotals, bomMap);
+
+    // baseline (yesterday)
+    let baselineById: Record<string, number> = {};
+    if (location) {
+      const prev = getMostRecentRunBeforeToday(location.key);
+      if (prev) prev.items.forEach(function(it){ baselineById[it.itemId] = Number(it.qty || 0); });
+    }
+
+    function unitOptionsForItem(id?: string): string[] {
+      if (!id) return [];
+      const it = getAllItemsById()[id];
+      if (!it?.uom) return [it?.unit || 'unit'];
+      const base = it.uom.base;
+      const others = Object.keys(it.uom.toBase || {});
+      // show base last (consumption usually in non-base units)
+      return [...others, base];
+    }
+
+    function BomEditor({ row }: { row: { key: string; name: string; sku?: string; qty: number } }) {
+      const [type, setType] = useState<'drink'|'pastry'|'other'>('drink');
+      const [cupId, setCupId] = useState<string>('');     const [cupQty, setCupQty] = useState<string>('1'); let cupUnits = unitOptionsForItem(cupId); const [cupU, setCupU] = useState<string>('');
+      const [lidId, setLidId] = useState<string>('');     const [lidQty, setLidQty] = useState<string>('1'); let lidUnits = unitOptionsForItem(lidId); const [lidU, setLidU] = useState<string>('');
+      const [milkId, setMilkId] = useState<string>('');   const [milkQty, setMilkQty] = useState<string>('0'); let milkUnits = unitOptionsForItem(milkId); const [milkU, setMilkU] = useState<string>('');
+      const [espId, setEspId] = useState<string>('');     const [espQty, setEspQty] = useState<string>('0'); let espUnits = unitOptionsForItem(espId);   const [espU, setEspU] = useState<string>('');
+      const [syrId, setSyrId] = useState<string>('');     const [syrQty, setSyrQty] = useState<string>('0'); let syrUnits = unitOptionsForItem(syrId); const [syrU, setSyrU] = useState<string>('');
+      const [bagId, setBagId] = useState<string>('');     const [bagQty, setBagQty] = useState<string>('1'); let bagUnits = unitOptionsForItem(bagId); const [bagU, setBagU] = useState<string>('');
+
+      const locItems = location ? itemsForLocation(location.key) : [];
+
+      function setDefaultU(unitList: string[], setter: (v:string)=>void) {
+        if (!unitList.length) return setter('');
+        // Prefer common consumption units if available
+        const pref = ['each','gram','quarter_lb'];
+        const match = unitList.find(u => pref.indexOf(u) >= 0);
+        setter(match || unitList[0]);
+      }
+
+      useEffect(function(){
+        setDefaultU(unitOptionsForItem(cupId), setCupU);
+      }, [cupId]);
+      useEffect(function(){
+        setDefaultU(unitOptionsForItem(lidId), setLidU);
+      }, [lidId]);
+      useEffect(function(){
+        setDefaultU(unitOptionsForItem(milkId), setMilkU);
+      }, [milkId]);
+      useEffect(function(){
+        setDefaultU(unitOptionsForItem(espId), setEspU);
+      }, [espId]);
+      useEffect(function(){
+        setDefaultU(unitOptionsForItem(syrId), setSyrU);
+      }, [syrId]);
+      useEffect(function(){
+        setDefaultU(unitOptionsForItem(bagId), setBagU);
+      }, [bagId]);
+
+      function save() {
+        const bom: Bom = {
+          key: row.key,
+          name: row.name || row.key,
+          sku: row.sku,
+          type,
+          comps: {
+            cup:   (type !== 'pastry' && cupId) ? { itemId: cupId, qty: Number(cupQty || '0'), uom: cupU || undefined } : undefined,
+            lid:   (type !== 'pastry' && lidId) ? { itemId: lidId, qty: Number(lidQty || '0'), uom: lidU || undefined } : undefined,
+            milk:  (type !== 'pastry' && milkId) ? { itemId: milkId, qty: Number(milkQty || '0'), uom: milkU || undefined } : undefined,
+            espresso: (type !== 'pastry' && espId) ? { itemId: espId, qty: Number(espQty || '0'), uom: espU || undefined } : undefined,
+            syrup: (type !== 'pastry' && syrId) ? { itemId: syrId, qty: Number(syrQty || '0'), uom: syrU || undefined } : undefined,
+            bag:   (type === 'pastry' && bagId) ? { itemId: bagId, qty: Number(bagQty || '0'), uom: bagU || undefined } : undefined,
+          },
+          updatedAt: new Date().toISOString()
+        };
+        saveBomEdit(bom);
+        alert('BOM saved for ' + (row.sku ? row.sku : row.name));
+      }
+
+      function SelectItem({ value, onChange }: { value: string; onChange: (v:string)=>void }) {
+        return (
+          <select className="w-full rounded border p-2 text-sm" value={value} onChange={function(e){ onChange(e.target.value); }}>
+            <option value="">-- choose item --</option>
+            {locItems.map(function(it){ return <option key={it.id} value={it.id}>{it.name}</option>; })}
+          </select>
+        );
+      }
+      function Num({ value, onChange, placeholder }: { value: string; onChange: (v:string)=>void; placeholder?: string }) {
+        return <input className="w-24 rounded border p-2 text-sm" inputMode="decimal" value={value} onChange={function(e){ onChange(e.target.value.replace(/[^0-9.]/g,'')); }} placeholder={placeholder || '0'} />;
+      }
+      function UnitSel({ list, value, onChange }: { list: string[]; value: string; onChange:(v:string)=>void }) {
+        if (!list.length) return <span className="text-xs text-gray-500 ml-2">(base)</span>;
+        return (
+          <select className="ml-2 rounded border p-1 text-xs" value={value} onChange={e => onChange(e.target.value)}>
+            {list.map(u => <option key={u} value={u}>{u}</option>)}
+          </select>
+        );
+      }
+
+      return (
+        <div className="border rounded-xl p-3 space-y-3">
+          <div className="text-sm"><span className="font-medium">Item:</span> {(row.sku ? (row.sku + ' — ') : '') + row.name} <span className="text-gray-500">(sold: {row.qty})</span></div>
+          <div className="flex items-center gap-3 text-sm">
+            <label className="flex items-center gap-1"><input type="radio" name={'type_' + row.key} checked={type==='drink'} onChange={function(){ setType('drink'); }} /> Drink</label>
+            <label className="flex items-center gap-1"><input type="radio" name={'type_' + row.key} checked={type==='pastry'} onChange={function(){ setType('pastry'); }} /> Pastry</label>
+            <label className="flex items-center gap-1"><input type="radio" name={'type_' + row.key} checked={type==='other'} onChange={function(){ setType('other'); }} /> Other</label>
+          </div>
+
+          {type !== 'pastry' ? (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+              <div><div className="text-gray-600 mb-1">Cup</div><SelectItem value={cupId} onChange={setCupId} /><div className="mt-1 flex items-center"><Num value={cupQty} onChange={setCupQty} placeholder="1" /> each<UnitSel list={cupUnits} value={cupU} onChange={setCupU} /></div></div>
+              <div><div className="text-gray-600 mb-1">Lid</div><SelectItem value={lidId} onChange={setLidId} /><div className="mt-1 flex items-center"><Num value={lidQty} onChange={setLidQty} placeholder="1" /> each<UnitSel list={lidUnits} value={lidU} onChange={setLidU} /></div></div>
+              <div><div className="text-gray-600 mb-1">Milk</div><SelectItem value={milkId} onChange={setMilkId} /><div className="mt-1 flex items-center"><Num value={milkQty} onChange={setMilkQty} placeholder="0.0" /> <UnitSel list={milkUnits} value={milkU} onChange={setMilkU} /></div></div>
+              <div><div className="text-gray-600 mb-1">Espresso/Coffee</div><SelectItem value={espId} onChange={setEspId} /><div className="mt-1 flex items-center"><Num value={espQty} onChange={setEspQty} placeholder="0.0" /> <UnitSel list={espUnits} value={espU} onChange={setEspU} /></div></div>
+              <div><div className="text-gray-600 mb-1">Syrup</div><SelectItem value={syrId} onChange={setSyrId} /><div className="mt-1 flex items-center"><Num value={syrQty} onChange={setSyrQty} placeholder="0.0" /> <UnitSel list={syrUnits} value={syrU} onChange={setSyrU} /></div></div>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+              <div><div className="text-gray-600 mb-1">Bag</div><SelectItem value={bagId} onChange={setBagId} /><div className="mt-1 flex items-center"><Num value={bagQty} onChange={setBagQty} placeholder="1" /> <UnitSel list={bagUnits} value={bagU} onChange={setBagU} /></div></div>
+            </div>
+          )}
+
+          <div><button className="px-4 py-2 rounded-xl bg-green-600 text-white hover:bg-green-700" onClick={save}>Save BOM</button></div>
+        </div>
+      );
+    }
+
+    // -------- Manage: inline editor (overrides) --------
+    function beginEdit(it: Item) {
+      setEditId(it.id);
+      setEditDraft({
+        name: it.name,
+        unit: it.unit,
+        supplier: it.supplier,
+        orderMultiple: it.orderMultiple,
+        sku: it.sku,
+        locations: it.locations.slice(),
+        par: it.par ? { ...it.par } : {},
+        uom: it.uom ? { base: it.uom.base, toBase: { ...it.uom.toBase } } : undefined,
+      });
+    }
+    function changeEdit<K extends keyof Item>(key: K, val: Item[K]) {
+      setEditDraft(d => ({ ...d, [key]: val }));
+    }
+    function changeEditPar(locKey: string, v: string) {
+      const n = v.replace(/[^0-9]/g,'');
+      setEditDraft(d => ({ ...d, par: { ...(d.par || {}), [locKey]: n === '' ? undefined as any : Number(n) } as any }));
+    }
+    function ensureUom() {
+      setEditDraft(d => {
+        const cur = (d.uom || { base: 'case', toBase: {} });
+        return { ...d, uom: { base: cur.base || 'case', toBase: cur.toBase || {} } };
+      });
+    }
+    function uomAddUnit() {
+  ensureUom();
+  setEditDraft(d => {
+    const cur = d.uom || { base: 'case', toBase: {} };
+    const name = prompt('Unit name (e.g., each, sleeve, gram, quarter_lb):','each');
+    if (!name) return d;
+    const msg = 'How many "' + name + '" in ONE "' + cur.base + '"? e.g., 1000 for cups each per case';
+    const per = Number(prompt(msg, '0') || '0');
+    const toBase = { ...(cur.toBase || {}) };
+    toBase[name] = Math.max(0, per);
+    return { ...d, uom: { base: cur.base, toBase } };
+  });
+} };
+        const name = prompt('Unit name (e.g., each, sleeve, gram, quarter_lb):','each');
+        if (!name) return d;
+        const per = Number(prompt(How many "" in ONE ""? e.g., 1000 for cups each per case, '0') || '0');
+        const toBase = { ...(cur.toBase || {}) };
+        toBase[name] = Math.max(0, per);
+        return { ...d, uom: { base: cur.base, toBase } };
+      });
+    }
+    function uomRemoveUnit(name: string) {
+      setEditDraft(d => {
+        if (!d.uom) return d;
+        const toBase = { ...(d.uom.toBase || {}) };
+        delete toBase[name];
+        return { ...d, uom: { base: d.uom.base, toBase } };
+      });
+    }
+    function saveEdit(it: Item) {
+      const overrides = loadOverrides();
+      // Clean empty pars
+      const parClean: Record<string, number> = {};
+      Object.keys(editDraft.par || {}).forEach(k => {
+        const v = (editDraft.par as any)[k];
+        if (v != null && v !== '' && !isNaN(v)) parClean[k] = Number(v);
+      });
+
+      overrides[it.id] = {
+        name: editDraft.name?.trim() || it.name,
+        unit: editDraft.unit?.trim() || it.unit,
+        supplier: editDraft.supplier?.trim() || it.supplier,
+        orderMultiple: editDraft.orderMultiple || it.orderMultiple,
+        sku: editDraft.sku?.trim() || it.sku,
+        locations: (editDraft.locations as string[])?.length ? (editDraft.locations as string[]) : it.locations,
+        par: Object.keys(parClean).length ? parClean : undefined,
+        uom: editDraft.uom ? {
+          base: editDraft.uom.base.trim() || (it.uom?.base || 'case'),
+          toBase: editDraft.uom.toBase || {},
+        } : undefined,
+      };
+      saveOverrides(overrides);
+      setEditId(null); setEditDraft({});
+      alert('Saved changes.');
+    }
+    function clearOverride(it: Item) {
+      const overrides = loadOverrides();
+      delete overrides[it.id];
+      saveOverrides(overrides);
+      setEditId(null); setEditDraft({});
+      alert('Cleared overrides for this item.');
+    }
+
+    return (
+      <div className="max-w-5xl mx-auto p-6 space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-semibold">Inventory</h1>
+          <Link href="/" className="text-blue-600 hover:underline">Home</Link>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="md:col-span-1">
+            <label className="block text-sm font-medium mb-1">Business</label>
+            <select className="w-full rounded-lg border p-2" value={group} onChange={function(e){ setGroup(e.target.value); }}>
+              <option value="Cenizo">Cenizo</option>
+              <option value="Sano Market">Sano Market</option>
+              <option value="Other">Other</option>
+            </select>
+          </div>
+          <div className="md:col-span-2">
+            <label className="block text-sm font-medium mb-1">Location</label>
+            <select
+              className="w-full rounded-lg border p-2"
+              value={location ? location.key : ''}
+              onChange={function(e){
+                var loc = groupLocations.find(function(l){ return l.key === e.target.value; }) || null;
+                setLocation(loc);
+              }}
+            >
+              {groupLocations.map(function(l){
+                return <option key={l.key} value={l.key}>{l.name}</option>;
+              })}
+            </select>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-3 items-center">
+          <button className="px-4 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700" onClick={startRun}>
+            Start / Resume Count
+          </button>
+          <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={prefillAddForm}>
+            Add Item
+          </button>
+          <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={() => setShowManage(!showManage)}>
+            Manage Items
+          </button>
+          <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={() => setShowImport(!showImport)}>
+            Import Toast CSV (prefill)
+          </button>
+          <label className="flex items-center gap-2 text-sm ml-auto">
+            <input type="checkbox" checked={carryForward} onChange={function(e){ setCarryForward(e.target.checked); }} />
+            Carry forward yesterday&apos;s counts
+          </label>
+        </div>
+
+        {showAdd && (
+          <div className="rounded-2xl border shadow-sm p-4 space-y-4">
+            <div className="font-medium">Add Inventory Item</div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="md:col-span-2">
+                <label className="block text-sm font-medium mb-1">Item name</label>
+                <input className="w-full rounded-lg border p-2" value={newName} onChange={function(e){ setNewName(e.target.value); }} placeholder="e.g., Oat Milk 32oz" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Unit label (optional)</label>
+                <input className="w-full rounded-lg border p-2" value={newUnit} onChange={function(e){ setNewUnit(e.target.value); }} placeholder="e.g., case(12), sleeve(50), 5lb bag" />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Supplier (optional)</label>
+                <input className="w-full rounded-lg border p-2" value={newSupplier} onChange={function(e){ setNewSupplier(e.target.value); }} placeholder="e.g., Distributor A" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Order multiple (optional)</label>
+                <input className="w-full rounded-lg border p-2" inputMode="numeric" value={newOrderMultiple} onChange={function(e){ setNewOrderMultiple(e.target.value.replace(/[^0-9]/g,'')); }} placeholder="e.g., 12" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">SKU (optional)</label>
+                <input className="w-full rounded-lg border p-2" value={newSku} onChange={function(e){ setNewSku(e.target.value); }} placeholder="e.g., ABC-123" />
+              </div>
+            </div>
+
+            <div>
+              <div className="text-sm font-medium mb-1">Locations (check) & Pars (optional)</div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                {LOCATIONS.map(function(l){
+                  const checked = !!newLocKeys[l.key];
+                  return (
+                    <div key={l.key} className="flex items-center gap-2">
+                      <input type="checkbox" checked={checked} onChange={function(){ toggleNewLoc(l.key); }} />
+                      <span className="text-sm">{l.group}: {l.name}</span>
+                      <input
+                        className="ml-auto w-20 rounded border p-1 text-sm"
+                        placeholder="par"
+                        inputMode="numeric"
+                        value={newPars[l.key] || ''}
+                        onChange={function(e){ setParInput(l.key, e.target.value); }}
+                        disabled={!checked}
+                        title="Par for this location"
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button className="px-4 py-2 rounded-xl bg-green-600 text-white hover:bg-green-700" onClick={createCustomItem}>Create</button>
+              <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={function(){ setShowAdd(false); }}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {showManage && (
+          <div className="rounded-2xl border shadow-sm p-4 space-y-3">
+            <div className="font-medium">All items</div>
+            <div className="overflow-auto">
+              <table className="min-w-full text-sm border">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="p-2 border">Name</th>
+                    <th className="p-2 border">Unit label</th>
+                    <th className="p-2 border">Supplier</th>
+                    <th className="p-2 border">Order multiple</th>
+                    <th className="p-2 border">SKU</th>
+                    <th className="p-2 border">Locations</th>
+                    <th className="p-2 border">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {all.sort((a,b)=>a.name.localeCompare(b.name)).map(function(it){
+                    const isEditing = editId === it.id;
+                    return (
+                      <tr key={it.id}>
+                        <td className="p-2 border align-top">
+                          {isEditing ? (
+                            <input className="w-56 rounded border p-1" value={editDraft.name || ''} onChange={e=>changeEdit('name', e.target.value)} />
+                          ) : it.name}
+                        </td>
+                        <td className="p-2 border align-top">
+                          {isEditing ? (
+                            <input className="w-40 rounded border p-1" value={editDraft.unit || ''} onChange={e=>changeEdit('unit', e.target.value)} placeholder="e.g., case(20)" />
+                          ) : (it.unit || '')}
+                        </td>
+                        <td className="p-2 border align-top">
+                          {isEditing ? (
+                            <input className="w-40 rounded border p-1" value={editDraft.supplier || ''} onChange={e=>changeEdit('supplier', e.target.value)} />
+                          ) : (it.supplier || '')}
+                        </td>
+                        <td className="p-2 border align-top">
+                          {isEditing ? (
+                            <input className="w-24 rounded border p-1" inputMode="numeric" value={String(editDraft.orderMultiple ?? '')} onChange={e=>changeEdit('orderMultiple', Number(e.target.value.replace(/[^0-9]/g,'')) || undefined)} />
+                          ) : (it.orderMultiple || '')}
+                        </td>
+                        <td className="p-2 border align-top">
+                          {isEditing ? (
+                            <input className="w-32 rounded border p-1" value={editDraft.sku || ''} onChange={e=>changeEdit('sku', e.target.value)} />
+                          ) : (it.sku || '')}
+                        </td>
+                        <td className="p-2 border align-top">
+                          {isEditing ? (
+                            <div className="space-y-1">
+                              {LOCATIONS.map(l => (
+                                <label key={l.key} className="flex items-center gap-2 text-xs">
+                                  <input
+                                    type="checkbox"
+                                    checked={(editDraft.locations as string[] | undefined)?.includes(l.key) || false}
+                                    onChange={e=>{
+                                      const cur = new Set(editDraft.locations as string[] || []);
+                                      if (e.target.checked) cur.add(l.key); else cur.delete(l.key);
+                                      changeEdit('locations', Array.from(cur));
+                                    }}
+                                  />
+                                  <span>{l.group}: {l.name}</span>
+                                  <input className="ml-auto w-16 rounded border p-1"
+                                    placeholder="par"
+                                    inputMode="numeric"
+                                    value={String((editDraft.par || {})[l.key] ?? '')}
+                                    onChange={ev=>changeEditPar(l.key, ev.target.value)} />
+                                </label>
+                              ))}
+                            </div>
+                          ) : it.locations.join(', ')}
+                        </td>
+                        <td className="p-2 border align-top whitespace-nowrap">
+                          {isEditing ? (
+                            <div className="space-y-2">
+                              <div className="text-xs text-gray-600">UOM mapping</div>
+                              <div className="flex items-center gap-2 text-xs">
+                                <span>Base:</span>
+                                <input className="w-24 rounded border p-1"
+                                  value={editDraft.uom?.base || ''}
+                                  onChange={e=>setEditDraft(d => ({ ...d, uom: { base: e.target.value, toBase: d.uom?.toBase || {} } }))}
+                                  placeholder="e.g., case, tub, bag" />
+                                <button className="px-2 py-1 rounded border hover:bg-gray-50" onClick={uomAddUnit}>+ unit</button>
+                              </div>
+                              {Object.entries(editDraft.uom?.toBase || {}).length === 0 ? (
+                                <div className="text-xs text-gray-500">No smaller units defined.</div>
+                              ) : (
+                                <div className="space-y-1">
+                                  {Object.entries(editDraft.uom!.toBase!).map(([uname, per]) => (
+                                    <div key={uname} className="flex items-center gap-2 text-xs">
+                                      <span className="w-24">{uname}</span>
+                                      <span>=</span>
+                                      <input className="w-20 rounded border p-1"
+                                        value={String(per)}
+                                        inputMode="numeric"
+                                        onChange={e=>{
+                                          const n = Number(e.target.value.replace(/[^0-9.]/g,'')) || 0;
+                                          setEditDraft(d => {
+                                            const uom = d.uom || { base: 'case', toBase: {} };
+                                            const next = { ...uom.toBase, [uname]: n };
+                                            return { ...d, uom: { base: uom.base, toBase: next } };
+                                          });
+                                        }} />
+                                      <span>per 1 {editDraft.uom?.base || 'base'}</span>
+                                      <button className="ml-2 px-2 py-0.5 rounded border hover:bg-gray-50" onClick={()=>uomRemoveUnit(uname)}>remove</button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              <div className="flex gap-2">
+                                <button className="px-3 py-1.5 rounded bg-green-600 text-white" onClick={()=>saveEdit(it)}>Save</button>
+                                <button className="px-3 py-1.5 rounded border" onClick={()=>{ setEditId(null); setEditDraft({}); }}>Cancel</button>
+                                <button className="px-3 py-1.5 rounded border" onClick={()=>clearOverride(it)}>Clear override</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex gap-2">
+                              <button className="px-2 py-1 rounded border hover:bg-gray-50" onClick={()=>beginEdit(it)}>Edit</button>
+                              <button className="px-2 py-1 rounded border hover:bg-gray-50" onClick={function(){ removeItem(it.id); }}>Remove</button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {all.length === 0 && (
+                    <tr><td className="p-2 border text-gray-500" colSpan={7}>No items.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <details>
+              <summary className="cursor-pointer text-sm">Hidden items (restore)</summary>
+              <div className="mt-2 overflow-auto">
+                {hiddenList.length === 0 ? (
+                  <div className="p-3 border rounded-lg bg-gray-50 text-sm">None hidden.</div>
+                ) : (
+                  <table className="min-w-full text-sm border">
+                    <thead className="bg-gray-50">
+                      <tr><th className="p-2 border">Name</th><th className="p-2 border">Actions</th></tr>
+                    </thead>
+                    <tbody>
+                      {hiddenList.sort((a,b)=>a.name.localeCompare(b.name)).map(function(h){
+                        return (
+                          <tr key={h.id}>
+                            <td className="p-2 border">{h.name}</td>
+                            <td className="p-2 border">
+                              <button className="px-2 py-1 rounded border hover:bg-gray-50" onClick={function(){ restoreHidden(h.id); }}>Restore</button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </details>
+          </div>
+        )}
+
+        {showImport && (
+          <div className="rounded-2xl border shadow-sm p-4 space-y-4">
+            <div className="font-medium">Import Toast CSV (sales → usage → prefill)</div>
+            {!location && <div className="text-sm text-red-600">Pick a location above first.</div>}
+
+            <input type="file" accept=".csv,text/csv" onChange={function(e){
+              const f = e.target.files && e.target.files[0]; if (f) handleFile(f);
+            }} />
+
+            {csvHeaders.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-sm font-medium">Map columns</div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                  <div>
+                    <div className="text-gray-600 mb-1">Item Name</div>
+                    <select className="w-full rounded border p-2" value={idxItem} onChange={function(e){
+                      const v = Number(e.target.value); setIdxItem(v);
+                      if (v >= 0 && idxQty >= 0) recomputeSoldTotals(csvRows, v, idxSku, idxQty);
+                    }}>
+                      <option value={-1}>-- choose --</option>
+                      {csvHeaders.map(function(h,i){ return <option key={i} value={i}>{h}</option>; })}
+                    </select>
+                  </div>
+                  <div>
+                    <div className="text-gray-600 mb-1">SKU (optional)</div>
+                    <select className="w-full rounded border p-2" value={idxSku} onChange={function(e){
+                      const v = Number(e.target.value); setIdxSku(v);
+                      if (idxItem >= 0 && idxQty >= 0) recomputeSoldTotals(csvRows, idxItem, v, idxQty);
+                    }}>
+                      <option value={-1}>-- none --</option>
+                      {csvHeaders.map(function(h,i){ return <option key={i} value={i}>{h}</option>; })}
+                    </select>
+                  </div>
+                  <div>
+                    <div className="text-gray-600 mb-1">Qty Sold</div>
+                    <select className="w-full rounded border p-2" value={idxQty} onChange={function(e){
+                      const v = Number(e.target.value); setIdxQty(v);
+                      if (idxItem >= 0 && v >= 0) recomputeSoldTotals(csvRows, idxItem, idxSku, v);
+                    }}>
+                      <option value={-1}>-- choose --</option>
+                      {csvHeaders.map(function(h,i){ return <option key={i} value={i}>{h}</option>; })}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="text-sm text-gray-700">
+                  Distinct sold items: {Object.keys(soldTotals).length} • Total units: {Object.values(soldTotals).reduce(function(a,b){return a + b.qty;}, 0)}
+                </div>
+              </div>
+            )}
+
+            {Object.keys(soldTotals).length > 0 && (
+              <div className="space-y-3">
+                <div className="font-medium">BOMs needed ({missingBoms.length} missing)</div>
+                {missingBoms.length === 0 ? (
+                  <div className="text-sm text-green-700">All sold items have BOMs.</div>
+                ) : (
+                  <div className="space-y-3">
+                    {missingBoms.slice(0,8).map(function(row){ return <BomEditor key={row.key} row={row} />; })}
+                    {missingBoms.length > 8 && <div className="text-sm text-gray-600">…and {missingBoms.length - 8} more after you save these.</div>}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {Object.keys(soldTotals).length > 0 && location && (
+              <div className="space-y-2">
+                <div className="font-medium">Projected usage & on-hand (preview)</div>
+                <div className="overflow-auto">
+                  <table className="min-w-full text-sm border">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="p-2 border">Item</th>
+                        <th className="p-2 border">Unit</th>
+                        <th className="p-2 border">Baseline (yesterday)</th>
+                        <th className="p-2 border">Usage from sales</th>
+                        <th className="p-2 border">Estimated on-hand</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {itemsForLocation(location.key).map(function(it){
+                        const u = Number(previewUsage[it.id] || 0);
+                        const base = Number(baselineById[it.id] || 0);
+                        const est = Math.max(0, base - u);
+                        return (
+                          <tr key={it.id}>
+                            <td className="p-2 border">{it.name}</td>
+                            <td className="p-2 border">{it.uom?.base || it.unit || ''}</td>
+                            <td className="p-2 border text-right">{base}</td>
+                            <td className="p-2 border text-right">{u.toFixed(2).replace(/\.00$/,'')}</td>
+                            <td className="p-2 border text-right">{Math.floor(est)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex gap-3">
+                  <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={function(){
+                    const u = computeUsageFromBoms(soldTotals, bomMap);
+                    setUsage(u);
+                    alert('Recomputed usage.');
+                  }}>Recompute usage</button>
+
+                  <button className="px-4 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700" onClick={applyPrefillToToday}>
+                    Apply Prefill to Today’s Run
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <details className="text-sm">
+              <summary className="cursor-pointer">Saved BOMs</summary>
+              <div className="mt-2 overflow-auto">
+                {Object.keys(bomMap).length === 0 ? (
+                  <div className="p-3 border rounded-lg bg-gray-50">No BOMs saved yet.</div>
+                ) : (
+                  <table className="min-w-full text-sm border">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="p-2 border">Key</th>
+                        <th className="p-2 border">Name</th>
+                        <th className="p-2 border">Type</th>
+                        <th className="p-2 border">Components</th>
+                        <th className="p-2 border">Updated</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.values(bomMap).sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(b){
+                        const parts: string[] = [];
+                        function labelOf(k:string){ if(k==='espresso')return 'Espresso'; return k.charAt(0).toUpperCase()+k.slice(1); }
+                        ['cup','lid','milk','espresso','syrup','bag'].forEach(function(k:any){
+                          // @ts-ignore
+                          const cc: BomComp | undefined = b.comps[k];
+                          if (!cc || !cc.itemId) return;
+                          const it = getAllItemsById()[cc.itemId];
+                          const nm = it ? it.name : '(missing)';
+                          parts.push(labelOf(String(k)) + ': ' + nm + ' × ' + String(cc.qty) + (cc.uom ? ' ' + cc.uom : ''));
+                        });
+                        return (
+                          <tr key={b.key}>
+                            <td className="p-2 border">{b.sku ? b.sku : b.key}</td>
+                            <td className="p-2 border">{b.name}</td>
+                            <td className="p-2 border">{b.type}</td>
+                            <td className="p-2 border">{parts.join('; ')}</td>
+                            <td className="p-2 border"><span suppressHydrationWarning>{new Date(b.updatedAt).toLocaleString()}</span></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </details>
+          </div>
+        )}
+
+        <details className="text-sm text-gray-600">
+          <summary className="cursor-pointer">Totals today (EP, DV, Chrysler Bend, Old Lockhart)</summary>
+          <div className="mt-2">
+            <button className="px-3 py-1.5 rounded-lg border hover:bg-gray-50 mb-3" onClick={function(){
+              const header = ['Item','Easton Park','Del Valle','Chrysler Bend','Old Lockhart','Total'];
+              const lines: string[] = [header.join(',')];
+              const t = computeTotalsToday();
+              t.forEach(function(row){
+                lines.push([
+                  csvEscape(row.name),
+                  String(row.per['Cenizo:Easton Park'] || 0),
+                  String(row.per['Cenizo:Del Valle'] || 0),
+                  String(row.per['Other:Chrysler Bend'] || 0),
+                  String(row.per['Other:Old Lockhart'] || 0),
+                  String(row.total || 0)
+                ].join(','));
+              });
+              const csv = lines.join('\n');
+              const file = 'inventory_totals_' + new Date().toISOString().slice(0,10) + '.csv';
+              download(file, csv, 'text/csv');
+            }}>Download Totals CSV</button>
+            <TotalsTable totals={computeTotalsToday()} />
+          </div>
+        </details>
+      </div>
+    );
+  }
+
+  // ---------- RUN SCREEN ----------
+  const cur = run.items[run.index];
+  const total = run.items.length;
+
+  const meta = getAllItemsById()[cur.itemId];
+  const parForHere = meta?.par ? Number(meta.par[run.locationKey] || 0) : undefined;
+  const omForHere  = meta?.orderMultiple || 1;
+  const typed = qtyInput === '' ? null : Math.max(0, Math.floor(Number(qtyInput)));
+  const onHandNow = (typed !== null ? typed : (cur.qty || 0));
+  const needNow = parForHere != null ? Math.max(0, parForHere - onHandNow) : undefined;
+  const suggestedOrder = parForHere != null ? Math.ceil((needNow || 0) / (omForHere || 1)) * (omForHere || 1) : undefined;
+
+  return (
+    <div className="max-w-2xl mx-auto p-6 space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Inventory — {run.locationName}</h1>
+          <div className="text-sm text-gray-600">By: {run.by || 'Unknown'} • <span suppressHydrationWarning>{new Date(run.dateLocalISO).toLocaleDateString()}</span></div>
+        </div>
+        <Link href="/" className="text-blue-600 hover:underline">Home</Link>
+      </div>
+
+      {total === 0 ? (
+        <div className="p-4 rounded-lg bg-yellow-50 border">No items for this location. Add items on the previous screen and include location key <code>{run.locationKey}</code>, then click Sync items.</div>
+      ) : (
+        <>
+          <div className="rounded-2xl border shadow-sm">
+            <div className="px-4 py-3 border-b flex items-center justify-between">
+              <div className="font-medium">Item {run.index + 1} of {total}</div>
+              <div className="text-sm text-gray-500">{cur.name}{cur.unit ? ' — ' + cur.unit : ''}</div>
+            </div>
+
+            <div className="p-4 space-y-4">
+              <input
+                type="number"
+                inputMode="numeric"
+                className="w-full border rounded-xl p-3 text-2xl"
+                placeholder="0"
+                value={qtyInput}
+                onChange={function(e){
+                  var v = e.target.value;
+                  if (v === '') { setQtyInput(''); return; }
+                  var num = Math.max(0, Math.floor(Number(v)));
+                  setQtyInput(String(num));
+                }}
+                onBlur={function(){ commitQty(); }}
+              />
+
+              <div className="rounded-xl border bg-gray-50 p-3 text-sm">
+                <div className="flex flex-wrap gap-4">
+                  <div><span className="text-gray-600">Supplier:</span> <span className="font-medium">{meta?.supplier || '—'}</span></div>
+                  <div><span className="text-gray-600">Par:</span> <span className="font-medium">{parForHere != null ? parForHere : '—'}</span></div>
+                  <div><span className="text-gray-600">On hand:</span> <span className="font-medium">{onHandNow}</span></div>
+                  <div><span className="text-gray-600">Need:</span> <span className="font-medium">{needNow != null ? needNow : '—'}</span></div>
+                  <div><span className="text-gray-600">Order multiple:</span> <span className="font-medium">{omForHere || 1}</span></div>
+                  <div><span className="text-gray-600">Suggested order:</span> <span className="font-medium">{suggestedOrder != null ? suggestedOrder : '—'}</span></div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button className="px-3 py-2 rounded-lg border" onClick={function(){ nudge(-5); }}>-5</button>
+                <button className="px-3 py-2 rounded-lg border" onClick={function(){ nudge(-1); }}>-1</button>
+                <button className="px-3 py-2 rounded-lg border" onClick={function(){ setQty(0); }}>Set 0</button>
+                <button className="px-3 py-2 rounded-lg border" onClick={function(){ nudge(1); }}>+1</button>
+                <button className="px-3 py-2 rounded-lg border" onClick={function(){ nudge(5); }}>+5</button>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={prev} disabled={run.index === 0}>Prev</button>
+                <div className="flex items-center gap-2">
+                  <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={manualSync}>Sync items</button>
+                  <button className="px-4 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700" onClick={saveAndNext} disabled={run.index >= total - 1}>Save & Next</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button className="px-4 py-2 rounded-xl bg-green-600 text-white hover:bg-green-700" onClick={complete}>
+              Complete Count (CSV)
+            </button>
+            <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={function(){ exportCSV(run); }}>
+              Download CSV
+            </button>
+            <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={function(){ exportOrderCSV(run); }}>
+              Generate Order Sheet (CSV)
+            </button>
+            <button className="px-4 py-2 rounded-xl border hover:bg-gray-50" onClick={function(){
+              if (!confirm('Reset inventory for this location for today?')) return;
+              var fresh = { ...run, items: run.items.map(function(it){ return { ...it, qty: 0 }; }), index: 0, completedAt: undefined, startedAt: new Date().toISOString() };
+              setRun(fresh); saveRun(fresh); setQtyInput('');
+            }}>
+              Reset Today
+            </button>
+          </div>
+
+          <div className="rounded-2xl border">
+            <div className="px-4 py-2 border-b font-medium">Quick List</div>
+            <ul className="max-h-64 overflow-auto divide-y">
+              {run.items.map(function(it, i){
+                const active = i === run.index;
+                return (
+                  <li
+                    key={it.itemId}
+                    onClick={function(){ jump(i); }}
+                    className={'px-4 py-2 flex items-center justify-between cursor-pointer hover:bg-gray-50 ' + (active ? 'bg-gray-50' : '')}
+                  >
+                    <div className="truncate">
+                      <div className="font-medium truncate">{it.name}</div>
+                      <div className="text-xs text-gray-500">{it.unit || ''}</div>
+                    </div>
+                    <div className="text-sm w-10 text-right">{it.qty}</div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+
+          <details className="text-sm text-gray-600">
+            <summary className="cursor-pointer">Totals today (EP, DV, Chrysler Bend, Old Lockhart)</summary>
+            <div className="mt-2">
+              <button className="px-3 py-1.5 rounded-lg border hover:bg-gray-50 mb-3" onClick={function(){
+                const header = ['Item','Easton Park','Del Valle','Chrysler Bend','Old Lockhart','Total'];
+                const lines: string[] = [header.join(',')];
+                const t = computeTotalsToday();
+                t.forEach(function(row){
+                  lines.push([
+                    csvEscape(row.name),
+                    String(row.per['Cenizo:Easton Park'] || 0),
+                    String(row.per['Cenizo:Del Valle'] || 0),
+                    String(row.per['Other:Chrysler Bend'] || 0),
+                    String(row.per['Other:Old Lockhart'] || 0),
+                    String(row.total || 0)
+                  ].join(','));
+                });
+                const csv = lines.join('\n');
+                const file = 'inventory_totals_' + new Date().toISOString().slice(0,10) + '.csv';
+                download(file, csv, 'text/csv');
+              }}>Download Totals CSV</button>
+              <TotalsTable totals={computeTotalsToday()} />
+            </div>
+          </details>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- Totals table ----------
+function TotalsTable({ totals }: { totals: Array<{ itemId: string; name: string; per: Record<string, number>; total: number }> }) {
+  const R = [
+    { key: 'Cenizo:Easton Park', label: 'Easton Park' },
+    { key: 'Cenizo:Del Valle', label: 'Del Valle' },
+    { key: 'Other:Chrysler Bend', label: 'Chrysler Bend' },
+    { key: 'Other:Old Lockhart', label: 'Old Lockhart' },
+  ];
+  return (
+    <div className="overflow-auto">
+      <table className="min-w-full text-sm border">
+        <thead className="bg-gray-50">
+          <tr>
+            <th className="p-2 border">Item</th>
+            {R.map(function(r){ return <th key={r.key} className="p-2 border">{r.label}</th>; })}
+            <th className="p-2 border">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {totals.map(function(row){
+            return (
+              <tr key={row.itemId}>
+                <td className="p-2 border">{row.name}</td>
+                {R.map(function(r){ return <td key={r.key} className="p-2 border text-right">{row.per[r.key] || 0}</td>; })}
+                <td className="p-2 border text-right font-medium">{row.total || 0}</td>
+              </tr>
+            );
+          })}
+          {totals.length === 0 && (
+            <tr><td className="p-2 border text-gray-500" colSpan={R.length + 2}>No counts saved yet today.</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
