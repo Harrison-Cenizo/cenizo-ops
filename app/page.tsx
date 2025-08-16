@@ -1,44 +1,74 @@
-﻿'use client';
-import { Amplify } from 'aws-amplify';
-import config from './aws-amplify-config';
-import Link from 'next/link';
-import { useEffect, useState } from 'react';
-import { getCurrentUser, fetchAuthSession, signInWithRedirect, signOut } from 'aws-amplify/auth';
+﻿"use client";
 
-Amplify.configure(config);
+import { useEffect, useState } from "react";
+import Link from "next/link";
 
-export default function Page() {
-  const [username, setUsername] = useState<string | null>(null);
+export default function Home() {
+  // make sure we're on the client before touching localStorage
   const [ready, setReady] = useState(false);
+  const [uid, setUid] = useState<string | null>(null);
 
   useEffect(() => {
-    (async () => {
-      try { await fetchAuthSession(); const u = await getCurrentUser(); setUsername(u.username); }
-      catch { setUsername(null); } finally { setReady(true); }
-    })();
+    setReady(true);
+    try {
+      setUid(localStorage.getItem("cenizo_user"));
+    } catch {}
   }, []);
 
-  if (!ready) return <div className='p-6'>Loading…</div>;
+  const signIn = () => {
+    try {
+      const id = crypto.randomUUID();
+      localStorage.setItem("cenizo_user", id);
+      window.location.href = "/inventory";
+    } catch (e) {
+      console.error(e);
+      alert("Sign-in needs localStorage/cookies enabled.");
+    }
+  };
+
+  const signOut = () => {
+    try {
+      localStorage.removeItem("cenizo_user");
+      setUid(null);
+    } catch {}
+  };
+
+  if (!ready) return null;
 
   return (
-    <div className='p-6 space-y-4'>
-      {username ? (
-        <>
-          <h3 className='text-2xl font-semibold'>Cenizo Ops — Signed in</h3>
-          <p>Welcome, {username}</p>
-          <div className='flex flex-wrap gap-3 pt-2'>
-            <Link href='/checklists' className='px-4 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700'>Open / Close Checklists</Link>
-            <Link href='/inventory' className='px-4 py-2 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700'>Inventory</Link>
-            <button className='px-4 py-2 rounded-xl border hover:bg-gray-50' onClick={() => signOut()}>Sign out</button>
-          </div>
-        </>
+    <main className="p-6 max-w-3xl mx-auto">
+      <h1 className="text-2xl font-semibold">Cenizo Ops — {uid ? "Signed in" : "Sign in"}</h1>
+
+      {!uid ? (
+        <button
+          onClick={signIn}
+          className="mt-6 px-4 py-2 rounded bg-indigo-600 text-white hover:bg-indigo-700"
+        >
+          Sign in
+        </button>
       ) : (
         <>
-          <h3 className='text-2xl font-semibold'>Cenizo Ops</h3>
-          <p>You&apos;re not signed in.</p>
-          <button className='px-4 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700' onClick={() => signInWithRedirect({ provider: 'COGNITO' })}>Sign in</button>
+          <p className="mt-2 text-sm text-gray-600">Welcome, {uid}</p>
+          <div className="flex gap-3 mt-4">
+            <Link href="/checklists">
+              <button className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700">
+                Open / Close Checklists
+              </button>
+            </Link>
+            <Link href="/inventory">
+              <button className="px-4 py-2 rounded bg-violet-600 text-white hover:bg-violet-700">
+                Inventory
+              </button>
+            </Link>
+            <button
+              onClick={signOut}
+              className="px-4 py-2 rounded border border-gray-300 hover:bg-gray-50"
+            >
+              Sign out
+            </button>
+          </div>
         </>
       )}
-    </div>
+    </main>
   );
 }
